@@ -8,3 +8,5 @@ trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_g
 print(trainable_parameters)
 
 model(pose3d, pose2d)
+y = model.reverse([pose3d, pose3d, pose3d], pose2d)
+print(y.shape)

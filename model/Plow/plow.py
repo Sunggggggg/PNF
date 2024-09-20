@@ -4,19 +4,22 @@ from .module import Block
 
 class Plow(nn.Module):
     def __init__(
-        self, in_channel=3, con_channel=2, hid_channel=256, n_flow=6, n_block=1, affine=True, conv_lu=True, condition=True
+        self, in_channel=3, con_channel=2, hid_channel=32, n_flow=6, n_block=1, affine=True, conv_lu=True, condition=True
     ):
         super().__init__()
-        self.input_proj1 = nn.Linear(in_channel, hid_channel)
-        self.input_proj2 = nn.Linear(con_channel, hid_channel)
+        #self.input_proj1 = nn.Linear(in_channel, hid_channel)
+        #self.input_proj2 = nn.Linear(con_channel, hid_channel)
         self.blocks = nn.ModuleList()
-        n_channel = con_channel = hid_channel
+        n_channel = in_channel
         for i in range(n_block - 1):
             self.blocks.append(Block(n_channel, con_channel, n_flow, affine=affine, conv_lu=conv_lu))
-        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine))
+        self.blocks.append(Block(n_channel, con_channel, n_flow, split=False, affine=affine))
 
-    def preprocessing(self, x, proj):
-        x = proj(x).permute(0, 2, 1).unsqueeze(-1)
+    def preprocessing(self, x, proj=None):
+        if proj is None :
+            x = x.permute(0, 2, 1).unsqueeze(-1)
+        else :
+            x = proj(x).permute(0, 2, 1).unsqueeze(-1)
         return x
 
     def forward(self, pose3d, condition):
@@ -24,8 +27,8 @@ class Plow(nn.Module):
         pose3d      : [B, J, 3]
         condition   : [B, J, 2]
         """
-        pose3d_feat = self.preprocessing(pose3d, self.input_proj1)      # [B, 256, J, 1]
-        pose2d_feat = self.preprocessing(condition, self.input_proj1)   # [B, 256, J, 1]
+        pose3d_feat = self.preprocessing(pose3d, None)      # [B, C, J, 1]
+        pose2d_feat = self.preprocessing(condition, None)   # [B, C, J, 1]
         out = pose3d_feat
 
         log_p_sum = 0
@@ -34,7 +37,7 @@ class Plow(nn.Module):
 
         for block in self.blocks:
             out, det, log_p, z_new = block(out, pose2d_feat)            # [B, C, J, 1]
-            z_outs.append(z_new)
+            z_outs.append(z_new)                                        # [B, C, J, 1]
             logdet = logdet + det
 
             if log_p is not None:
@@ -45,9 +48,13 @@ class Plow(nn.Module):
     def reverse(self, z_list, condition, reconstruct=False):
         for i, block in enumerate(self.blocks[::-1]):
             if i == 0:
-                input = block.reverse(z_list[-1], z_list[-1], reconstruct=reconstruct)
+                pose3d_feat = self.preprocessing(z_list[-1], None)      # [B, C, J, 1]
+                pose2d_feat = self.preprocessing(condition, None)   # [B, C, J, 1]
+                input = block.reverse(pose3d_feat, pose2d_feat, pose3d_feat, reconstruct=reconstruct)
 
             else:
-                input = block.reverse(input, z_list[-(i + 1)], reconstruct=reconstruct)
+                pose3d_feat = self.preprocessing(z_list[-(i + 1)], None)      # [B, C, J, 1]
+                pose2d_feat = self.preprocessing(condition, None)   # [B, C, J, 1]
+                input = block.reverse(input, pose2d_feat, pose3d_feat, reconstruct=reconstruct)
 
         return input

@@ -9,18 +9,18 @@ from .zero_init_module import *
 logabs = lambda x: torch.log(torch.abs(x))
 
 class AffineInjection(nn.Module):
-    def __init__(self, in_channel, filter_size=256):
+    def __init__(self, in_channel, out_channel, filter_size=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_channel, filter_size, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(filter_size, filter_size, 1),
             nn.ReLU(inplace=True),
-            ZeroConv2d(filter_size, in_channel),
+            ZeroConv2d(filter_size, out_channel*2),
         )
 
     def forward(self, input, condition):
-        log_s, t = self.net(condition).chunk(2, 1)  # [B, 3, J, 1]
+        log_s, t = self.net(condition).chunk(2, 1)  # [B, C/2, J, 1]
         s = F.sigmoid(log_s + 2)
         out = (input + t) * s
 
@@ -40,12 +40,13 @@ class ConditionalAffineCoupling(nn.Module):
 
         self.affine = affine
 
+        n_channel = in_channel - in_channel//2  # 3, 1
         self.net = nn.Sequential(
-            nn.Conv2d(in_channel+con_channel, filter_size, 3, padding=1),
+            nn.Conv2d(n_channel + con_channel, filter_size, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(filter_size, filter_size, 1),
             nn.ReLU(inplace=True),
-            ZeroConv2d(filter_size, in_channel),
+            ZeroConv2d(filter_size, in_channel//2 * 2),
         )
 
         self.net[0].weight.data.normal_(0, 0.05)
@@ -59,11 +60,11 @@ class ConditionalAffineCoupling(nn.Module):
         pose_feat : [B, C, J, 1]
         condition : [B, C, J, 1]
         """
-        in_a, in_b = pose3d.chunk(2, 1)             # [B, C/2, J, 1], [B, C/2, J, 1]
+        in_a, in_b = pose3d.chunk(2, 1)             # [B, 2, J, 1], [B, 1, J, 1]
 
         if self.affine:
-            z = torch.cat([in_a, condition], dim=1) # [B, C/2+C, J, 1]
-            log_s, t = self.net(z).chunk(2, 1)      # [B, C/2, J, 1]
+            z = torch.cat([in_a, condition], dim=1) # [B, 4, J, 1]
+            log_s, t = self.net(z).chunk(2, 1)      # [B, 2, J, 1]
             s = F.sigmoid(log_s + 2)
             out_b = (in_b + t) * s
 
@@ -286,7 +287,7 @@ class Flow(nn.Module):
 
         if condition :
             self.coupling = ConditionalAffineCoupling(in_channel, con_channel, affine=affine)
-            self.injection = AffineInjection(in_channel)
+            self.injection = AffineInjection(con_channel, in_channel)
         else:
             self.coupling = AffineCoupling(in_channel, affine=affine)
 
@@ -338,14 +339,13 @@ class Block(nn.Module):
 
         if split:
             self.prior = ZeroConv2d(in_channel//2, in_channel)
-
         else:
-            self.prior = ZeroConv2d(in_channel, in_channel* 2)
+            self.prior = ZeroConv2d(in_channel, in_channel*2)
 
     def forward(self, pose_feat, condition):
         """
-        pose_feat   : [B, C, J, 1]
-        out         : [B, C, J, 1]
+        pose_feat   : [B, 3, J, 1]
+        out         : [B, 3, J, 1]
         logdet      : [B]
         log_p       : [B]
         z_new       : [B, C/2, J, 1]
@@ -363,7 +363,6 @@ class Block(nn.Module):
             mean, log_sd = self.prior(out).chunk(2, 1)      # [B, C/2, J, 1], [B, C/2, J, 1]
             log_p = gaussian_log_p(z_new, mean, log_sd)     # [B, C/2, J, 1]
             log_p = log_p.view(B, -1).sum(1)                # [B]
-
         else:
             zero = torch.zeros_like(out)
             mean, log_sd = self.prior(zero).chunk(2, 1)
@@ -399,14 +398,9 @@ class Block(nn.Module):
         for flow in self.flows[::-1]:
             input = flow.reverse(input, condition)
 
-        b_size, n_channel, height, width = input.shape
+        B, C, N, _ = input.shape
 
-        unsqueezed = input.view(b_size, n_channel // 4, 2, 2, height, width)
-        unsqueezed = unsqueezed.permute(0, 1, 4, 2, 5, 3)
-        unsqueezed = unsqueezed.contiguous().view(
-            b_size, n_channel // 4, height * 2, width * 2
-        )
-
+        unsqueezed = input
         return unsqueezed
     
 
