@@ -4,9 +4,92 @@ from torch.nn import functional as F
 from math import log, pi, exp
 import numpy as np
 from scipy import linalg as la
+from .zero_init_module import *
 
 logabs = lambda x: torch.log(torch.abs(x))
 
+class AffineInjection(nn.Module):
+    def __init__(self, in_channel, filter_size=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channel, filter_size, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(filter_size, filter_size, 1),
+            nn.ReLU(inplace=True),
+            ZeroConv2d(filter_size, in_channel),
+        )
+
+    def forward(self, input, condition):
+        log_s, t = self.net(condition).chunk(2, 1)  # [B, 3, J, 1]
+        s = F.sigmoid(log_s + 2)
+        out = (input + t) * s
+
+        logdet = torch.sum(torch.log(s).view(input.shape[0], -1), 1)
+
+        return out, logdet
+    
+    def reverse(self, out, condition):
+        log_s, t = self.net(condition).chunk(2, 1)  # [B, 3, J, 1]
+        s = F.sigmoid(log_s + 2)
+        input = out / s - t
+        return input
+
+class ConditionalAffineCoupling(nn.Module):
+    def __init__(self, in_channel, con_channel, filter_size=512, affine=True):
+        super().__init__()
+
+        self.affine = affine
+
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channel+con_channel, filter_size, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(filter_size, filter_size, 1),
+            nn.ReLU(inplace=True),
+            ZeroConv2d(filter_size, in_channel),
+        )
+
+        self.net[0].weight.data.normal_(0, 0.05)
+        self.net[0].bias.data.zero_()
+
+        self.net[2].weight.data.normal_(0, 0.05)
+        self.net[2].bias.data.zero_()
+
+    def forward(self, pose3d, condition=None):
+        """
+        pose_feat : [B, C, J, 1]
+        condition : [B, C, J, 1]
+        """
+        in_a, in_b = pose3d.chunk(2, 1)             # [B, C/2, J, 1], [B, C/2, J, 1]
+
+        if self.affine:
+            z = torch.cat([in_a, condition], dim=1) # [B, C/2+C, J, 1]
+            log_s, t = self.net(z).chunk(2, 1)      # [B, C/2, J, 1]
+            s = F.sigmoid(log_s + 2)
+            out_b = (in_b + t) * s
+
+            logdet = torch.sum(torch.log(s).view(pose3d.shape[0], -1), 1)
+
+        else:
+            net_out = self.net(in_a)
+            out_b = in_b + net_out
+            logdet = None
+
+        return torch.cat([in_a, out_b], 1), logdet
+    
+    def reverse(self, output, condition=None):
+        out_a, out_b = output.chunk(2, 1)
+
+        if self.affine:
+            z = torch.cat([out_a, condition], dim=1) # [B, C/2+C, J, 1]
+            log_s, t = self.net(z).chunk(2, 1)       # [B, C/2, J, 1]
+            s = F.sigmoid(log_s + 2)
+            in_b = out_b / s - t
+
+        else:
+            net_out = self.net(out_a)
+            in_b = out_b - net_out
+
+        return torch.cat([out_a, in_b], 1)
 
 class ActNorm(nn.Module):
     def __init__(self, in_channel, logdet=True):
@@ -59,7 +142,6 @@ class ActNorm(nn.Module):
     def reverse(self, output):
         return output / self.scale - self.loc
 
-
 class InvConv2d(nn.Module):
     def __init__(self, in_channel):
         super().__init__()
@@ -83,7 +165,6 @@ class InvConv2d(nn.Module):
         return F.conv2d(
             output, self.weight.squeeze().inverse().unsqueeze(2).unsqueeze(3)
         )
-
 
 class InvConv2dLU(nn.Module):
     def __init__(self, in_channel):
@@ -134,75 +215,6 @@ class InvConv2dLU(nn.Module):
         weight = self.calc_weight()
 
         return F.conv2d(output, weight.squeeze().inverse().unsqueeze(2).unsqueeze(3))
-
-
-class ZeroConv2d(nn.Module):
-    def __init__(self, in_channel, out_channel, padding=1):
-        super().__init__()
-
-        self.conv = nn.Conv2d(in_channel, out_channel, 3, padding=0)
-        self.conv.weight.data.zero_()
-        self.conv.bias.data.zero_()
-        self.scale = nn.Parameter(torch.zeros(1, out_channel, 1, 1))
-
-    def forward(self, input):
-        out = F.pad(input, [1, 1, 1, 1], value=1)
-        out = self.conv(out)
-        out = out * torch.exp(self.scale * 3)
-
-        return out
-
-class ConditionalAffineCoupling(nn.Module):
-    def __init__(self, in_channel, filter_size=512, affine=True):
-        super().__init__()
-
-        self.affine = affine
-
-        self.fusing = nn.Sequential(
-            nn.Conv2d(in_channel*2, filter_size, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(filter_size, filter_size, 3, padding=1)
-        )
-
-        self.net = nn.Sequential(
-            nn.Conv2d(filter_size // 2, filter_size, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(filter_size, filter_size, 1),
-            nn.ReLU(inplace=True),
-            ZeroConv2d(filter_size, in_channel if self.affine else in_channel // 2),
-        )
-
-        self.net[0].weight.data.normal_(0, 0.05)
-        self.net[0].bias.data.zero_()
-
-        self.net[2].weight.data.normal_(0, 0.05)
-        self.net[2].bias.data.zero_()
-
-    def forward(self, pose_feat, condition=None):
-        """
-        pose_feat : [B, C, J, 1]
-        condition : [B, C, J, 1]
-        """
-        if condition is not None :
-            _pose_feat = pose_feat.clone()
-            in_a, in_b = _pose_feat.chunk(2, 1)                       # [B, C/2, J, 1]
-            _pose_feat = torch.cat([_pose_feat, condition], dim=1) # [B, 2C, J, 1]
-            _pose_feat = self.fusing(_pose_feat)                   # [B, D, J, 1]
-            _in_a, _ = _pose_feat.chunk(2, 1)                       # [B, D/2, J, 1]
-
-        if self.affine:
-            log_s, t = self.net(_in_a).chunk(2, 1)                  # [B, C/2, J, 1]
-            s = F.sigmoid(log_s + 2)
-            out_b = (in_b + t) * s
-
-            logdet = torch.sum(torch.log(s).view(pose_feat.shape[0], -1), 1)
-
-        else:
-            net_out = self.net(in_a)
-            out_b = in_b + net_out
-            logdet = None
-
-        return torch.cat([in_a, out_b], 1), logdet
 
 class AffineCoupling(nn.Module):
     def __init__(self, in_channel, filter_size=512, affine=True):
@@ -262,21 +274,19 @@ class AffineCoupling(nn.Module):
 
         return torch.cat([out_a, in_b], 1)
 
-
 class Flow(nn.Module):
-    def __init__(self, in_channel, affine=True, conv_lu=True, condition=True):
+    def __init__(self, in_channel, con_channel, affine=True, conv_lu=True, condition=True):
         super().__init__()
-
         self.actnorm = ActNorm(in_channel)
-
+        
         if conv_lu:
             self.invconv = InvConv2dLU(in_channel)
-
         else:
             self.invconv = InvConv2d(in_channel)
 
         if condition :
-            self.coupling = ConditionalAffineCoupling(in_channel, affine=affine)
+            self.coupling = ConditionalAffineCoupling(in_channel, con_channel, affine=affine)
+            self.injection = AffineInjection(in_channel)
         else:
             self.coupling = AffineCoupling(in_channel, affine=affine)
 
@@ -285,18 +295,23 @@ class Flow(nn.Module):
         pose_feat   : [B, C, J, 1]
         out         : [B, C, J, 1]
         """
-        out, logdet = self.actnorm(pose_feat)   # [B, C, J, 1]
-        out, det1 = self.invconv(out)           # [B, C', J, 1]
-        out, det2 = self.coupling(out, condition)          # [B, C, J, 1]
+        out, logdet = self.actnorm(pose_feat)               # [B, C, J, 1]
+        out, det1 = self.invconv(out)                       # [B, C, J, 1]
+        out, det2 = self.injection(out, condition)
+        out, det3 = self.coupling(out, condition)           # [B, C, J, 1]
 
         logdet = logdet + det1
         if det2 is not None:
             logdet = logdet + det2
 
+        if det3 is not None:
+            logdet = logdet + det3
+
         return out, logdet
 
-    def reverse(self, output):
-        input = self.coupling.reverse(output)
+    def reverse(self, output, condition):
+        input = self.coupling.reverse(output, condition)
+        input = self.injection.reverse(output, condition)
         input = self.invconv.reverse(input)
         input = self.actnorm.reverse(input)
 
@@ -312,22 +327,22 @@ def gaussian_sample(eps, mean, log_sd):
 
 
 class Block(nn.Module):
-    def __init__(self, hidden_channel, n_flow, split=True, affine=True, conv_lu=True):
+    def __init__(self, in_channel, con_channel, n_flow, split=True, affine=True, conv_lu=True):
         super().__init__()
-        self.hidden_channel = hidden_channel
+
         self.flows = nn.ModuleList()
         for i in range(n_flow):
-            self.flows.append(Flow(hidden_channel, affine=affine, conv_lu=conv_lu))
+            self.flows.append(Flow(in_channel, con_channel, affine=affine, conv_lu=conv_lu))
 
         self.split = split
 
         if split:
-            self.prior = ZeroConv2d(hidden_channel//2, hidden_channel)
+            self.prior = ZeroConv2d(in_channel//2, in_channel)
 
         else:
-            self.prior = ZeroConv2d(hidden_channel, hidden_channel * 2)
+            self.prior = ZeroConv2d(in_channel, in_channel* 2)
 
-    def forward(self, pose_feat, condition=None):
+    def forward(self, pose_feat, condition):
         """
         pose_feat   : [B, C, J, 1]
         out         : [B, C, J, 1]
@@ -336,7 +351,6 @@ class Block(nn.Module):
         z_new       : [B, C/2, J, 1]
         """
         B, C, J, _ = pose_feat.shape
-        assert C == self.hidden_channel, f'Tensor dim {C} != Weight dim {self.hidden_channel}'
         out = pose_feat
 
         logdet = 0
@@ -359,7 +373,7 @@ class Block(nn.Module):
 
         return out, logdet, log_p, z_new
 
-    def reverse(self, output, eps=None, reconstruct=False):
+    def reverse(self, output, condition, eps=None, reconstruct=False):
         input = output
 
         if reconstruct:
@@ -383,7 +397,7 @@ class Block(nn.Module):
                 input = z
 
         for flow in self.flows[::-1]:
-            input = flow.reverse(input)
+            input = flow.reverse(input, condition)
 
         b_size, n_channel, height, width = input.shape
 

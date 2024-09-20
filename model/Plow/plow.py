@@ -4,35 +4,36 @@ from .module import Block
 
 class Plow(nn.Module):
     def __init__(
-        self, in_channel=3, hidden_channel=32, n_flow=6, n_block=1, affine=True, conv_lu=True, condition=True
+        self, in_channel=3, con_channel=2, hid_channel=256, n_flow=6, n_block=1, affine=True, conv_lu=True, condition=True
     ):
         super().__init__()
-        self.pos_embed = nn.Linear(in_channel, hidden_channel)
-        if condition :
-            self.condition_embed = nn.Linear(2, hidden_channel)
-
+        self.input_proj1 = nn.Linear(in_channel, hid_channel)
+        self.input_proj2 = nn.Linear(con_channel, hid_channel)
         self.blocks = nn.ModuleList()
-        n_channel = hidden_channel
+        n_channel = con_channel = hid_channel
         for i in range(n_block - 1):
-            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu))
-            n_channel *= 2
+            self.blocks.append(Block(n_channel, con_channel, n_flow, affine=affine, conv_lu=conv_lu))
         self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine))
 
-    def forward(self, pose3d, condition=None):
+    def preprocessing(self, x, proj):
+        x = proj(x).permute(0, 2, 1).unsqueeze(-1)
+        return x
+
+    def forward(self, pose3d, condition):
         """
         pose3d      : [B, J, 3]
         condition   : [B, J, 2]
         """
-        pose_feat = self.pos_embed(pose3d).permute(0, 2, 1).unsqueeze(-1)   # [B, C, J, 1]
-        condition = self.condition_embed(condition).permute(0, 2, 1).unsqueeze(-1)
-        out = pose_feat
+        pose3d_feat = self.preprocessing(pose3d, self.input_proj1)      # [B, 256, J, 1]
+        pose2d_feat = self.preprocessing(condition, self.input_proj1)   # [B, 256, J, 1]
+        out = pose3d_feat
 
         log_p_sum = 0
         logdet = 0
         z_outs = []
 
         for block in self.blocks:
-            out, det, log_p, z_new = block(out, condition)     # [B, C, J, 1]
+            out, det, log_p, z_new = block(out, pose2d_feat)            # [B, C, J, 1]
             z_outs.append(z_new)
             logdet = logdet + det
 
