@@ -35,18 +35,19 @@ class AffineInjection(nn.Module):
         return input
 
 class ConditionalAffineCoupling(nn.Module):
-    def __init__(self, in_channel, con_channel, filter_size=512, affine=True):
+    def __init__(self, in_channel=3, con_channel=2, filter_size=512, affine=True):
         super().__init__()
 
         self.affine = affine
 
-        n_channel = in_channel - in_channel//2  # 3, 1
+        split_channel = int(in_channel/2 + 0.5) # 2
+
         self.net = nn.Sequential(
-            nn.Conv2d(n_channel + con_channel, filter_size, 3, padding=1),
+            nn.Conv2d(split_channel + con_channel, filter_size, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(filter_size, filter_size, 1),
             nn.ReLU(inplace=True),
-            ZeroConv2d(filter_size, in_channel//2 * 2),
+            ZeroConv2d(filter_size, (in_channel-split_channel)*2),
         )
 
         self.net[0].weight.data.normal_(0, 0.05)
@@ -62,27 +63,20 @@ class ConditionalAffineCoupling(nn.Module):
         """
         in_a, in_b = pose3d.chunk(2, 1)             # [B, 2, J, 1], [B, 1, J, 1]
 
-        if self.affine:
-            z = torch.cat([in_a, condition], dim=1) # [B, 4, J, 1]
-            log_s, t = self.net(z).chunk(2, 1)      # [B, 2, J, 1]
-            s = F.sigmoid(log_s + 2)
-            out_b = (in_b + t) * s
+        z = torch.cat([in_a, condition], dim=1) # [B, 4, J, 1]
+        log_s, t = self.net(z).chunk(2, 1)      # [B, 1, J, 1]
+        s = F.sigmoid(log_s + 2)
+        out_b = (in_b + t) * s
 
-            logdet = torch.sum(torch.log(s).view(pose3d.shape[0], -1), 1)
-
-        else:
-            net_out = self.net(in_a)
-            out_b = in_b + net_out
-            logdet = None
-
+        logdet = torch.sum(torch.log(s).view(pose3d.shape[0], -1), 1)
         return torch.cat([in_a, out_b], 1), logdet
     
     def reverse(self, output, condition=None):
         out_a, out_b = output.chunk(2, 1)
 
         if self.affine:
-            z = torch.cat([out_a, condition], dim=1) # [B, C/2+C, J, 1]
-            log_s, t = self.net(z).chunk(2, 1)       # [B, C/2, J, 1]
+            z = torch.cat([out_a, condition], dim=1) # [B, 2+2, J, 1]
+            log_s, t = self.net(z).chunk(2, 1)       # [B, 1, J, 1]
             s = F.sigmoid(log_s + 2)
             in_b = out_b / s - t
 
@@ -123,22 +117,17 @@ class ActNorm(nn.Module):
             self.loc.data.copy_(-mean)
             self.scale.data.copy_(1 / (std + 1e-6))
 
-    def forward(self, pose_feat):
-        _, _, num_joint, _ = pose_feat.shape
+    def forward(self, input):
+        _, _, h, w = input.shape
 
         if self.initialized.item() == 0:
-            self.initialize(pose_feat)
+            self.initialize(input)
             self.initialized.fill_(1)
 
         log_abs = logabs(self.scale)
+        logdet = h * w * torch.sum(log_abs)
 
-        logdet = num_joint * torch.sum(log_abs)
-
-        if self.logdet:
-            return self.scale * (pose_feat + self.loc), logdet
-
-        else:
-            return self.scale * (pose_feat + self.loc)
+        return self.scale * (input + self.loc), logdet
 
     def reverse(self, output):
         return output / self.scale - self.loc
@@ -276,7 +265,7 @@ class AffineCoupling(nn.Module):
         return torch.cat([out_a, in_b], 1)
 
 class Flow(nn.Module):
-    def __init__(self, in_channel, con_channel, affine=True, conv_lu=True, condition=True):
+    def __init__(self, in_channel=3, con_channel=2, affine=True, conv_lu=True, condition=True):
         super().__init__()
         self.actnorm = ActNorm(in_channel)
         
@@ -318,14 +307,11 @@ class Flow(nn.Module):
 
         return input
 
-
 def gaussian_log_p(x, mean, log_sd):
     return -0.5 * log(2 * pi) - log_sd - 0.5 * (x - mean) ** 2 / torch.exp(2 * log_sd)
 
-
 def gaussian_sample(eps, mean, log_sd):
     return mean + torch.exp(log_sd) * eps
-
 
 class Block(nn.Module):
     def __init__(self, in_channel, con_channel, n_flow, split=True, affine=True, conv_lu=True):
@@ -336,35 +322,35 @@ class Block(nn.Module):
             self.flows.append(Flow(in_channel, con_channel, affine=affine, conv_lu=conv_lu))
 
         self.split = split
-
         if split:
-            self.prior = ZeroConv2d(in_channel//2, in_channel)
+            split_channel = int(in_channel/2 + 0.5)
+            self.prior = ZeroConv2d(split_channel, (in_channel-split_channel)*2)
         else:
             self.prior = ZeroConv2d(in_channel, in_channel*2)
 
-    def forward(self, pose_feat, condition):
+    def forward(self, input, condition):
         """
-        pose_feat   : [B, 3, J, 1]
-        out         : [B, 3, J, 1]
+        pose_feat   : [B, 3, 19, 1]
+        out         : [B, 3, 19, 1]
         logdet      : [B]
         log_p       : [B]
-        z_new       : [B, C/2, J, 1]
+        z_new       : [B, C/2, 19, 1]
         """
-        B, C, J, _ = pose_feat.shape
-        out = pose_feat
+        B, C, J, _ = input.shape
+        out = input
 
         logdet = 0
         for flow in self.flows:
-            out, det = flow(out, condition)        # [B, C, J, 1]
-            logdet = logdet + det       # 
+            out, det = flow(out, condition)      # [B, 3, J, 1], [B, 2, J, 1]
+            logdet = logdet + det                # 
 
         if self.split:
-            out, z_new = out.chunk(2, 1)                    # [B, C/2, J, 1]
-            mean, log_sd = self.prior(out).chunk(2, 1)      # [B, C/2, J, 1], [B, C/2, J, 1]
-            log_p = gaussian_log_p(z_new, mean, log_sd)     # [B, C/2, J, 1]
+            out, z_new = out.chunk(2, 1)                    # [B, 2, 19, 1], [B, 1, 19, 1]
+            mean, log_sd = self.prior(out).chunk(2, 1)      # [B, 1, J, 1], [B, 1, J, 1]
+            log_p = gaussian_log_p(z_new, mean, log_sd)     # [B, 1, J, 1]
             log_p = log_p.view(B, -1).sum(1)                # [B]
         else:
-            zero = torch.zeros_like(out)
+            zero = torch.zeros_like(out)                    # [B, 3, 19, 1]
             mean, log_sd = self.prior(zero).chunk(2, 1)
             log_p = gaussian_log_p(out, mean, log_sd)
             log_p = log_p.view(B, -1).sum(1)
@@ -402,10 +388,3 @@ class Block(nn.Module):
 
         unsqueezed = input
         return unsqueezed
-    
-
-if __name__ == '__main__':
-    x = torch.rand((1, 256, 19, 1))
-    model = Flow(in_channel=256)
-    out, logdet = model(x)
-    print(out.shape)

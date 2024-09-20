@@ -4,11 +4,9 @@ from .module import Block
 
 class Plow(nn.Module):
     def __init__(
-        self, in_channel=3, con_channel=2, hid_channel=32, n_flow=6, n_block=1, affine=True, conv_lu=True, condition=True
+        self, in_channel=3, con_channel=2, n_flow=6, n_block=1, affine=True, conv_lu=True
     ):
         super().__init__()
-        #self.input_proj1 = nn.Linear(in_channel, hid_channel)
-        #self.input_proj2 = nn.Linear(con_channel, hid_channel)
         self.blocks = nn.ModuleList()
         n_channel = in_channel
         for i in range(n_block - 1):
@@ -22,21 +20,21 @@ class Plow(nn.Module):
             x = proj(x).permute(0, 2, 1).unsqueeze(-1)
         return x
 
-    def forward(self, pose3d, condition):
+    def forward(self, pose3d, pose2d):
         """
         pose3d      : [B, J, 3]
         condition   : [B, J, 2]
         """
-        pose3d_feat = self.preprocessing(pose3d, None)      # [B, C, J, 1]
-        pose2d_feat = self.preprocessing(condition, None)   # [B, C, J, 1]
-        out = pose3d_feat
+        input = self.preprocessing(pose3d, None)        # [B, C, J, 1]
+        condition = self.preprocessing(pose2d, None)    # [B, C, J, 1]
+        out = input
 
         log_p_sum = 0
         logdet = 0
         z_outs = []
 
         for block in self.blocks:
-            out, det, log_p, z_new = block(out, pose2d_feat)            # [B, C, J, 1]
+            out, det, log_p, z_new = block(out, condition)            # [B, C, J, 1]
             z_outs.append(z_new)                                        # [B, C, J, 1]
             logdet = logdet + det
 
@@ -49,12 +47,12 @@ class Plow(nn.Module):
         for i, block in enumerate(self.blocks[::-1]):
             if i == 0:
                 pose3d_feat = self.preprocessing(z_list[-1], None)      # [B, C, J, 1]
-                pose2d_feat = self.preprocessing(condition, None)   # [B, C, J, 1]
+                pose2d_feat = self.preprocessing(condition, None)       # [B, C, J, 1]
                 input = block.reverse(pose3d_feat, pose2d_feat, pose3d_feat, reconstruct=reconstruct)
 
             else:
                 pose3d_feat = self.preprocessing(z_list[-(i + 1)], None)      # [B, C, J, 1]
-                pose2d_feat = self.preprocessing(condition, None)   # [B, C, J, 1]
+                pose2d_feat = self.preprocessing(condition, None)             # [B, C, J, 1]
                 input = block.reverse(input, pose2d_feat, pose3d_feat, reconstruct=reconstruct)
 
         return input
