@@ -1,12 +1,12 @@
 import torch
-from model.Plow import Plow
+from model.Plow.coupling import NN, Coupling
 
-pose3d = torch.rand((1, 19, 3))
-pose2d = torch.rand((1, 19, 2))
-model = Plow(n_flow=24, n_block=1)
-trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(trainable_parameters)
+x = torch.rand((1, 3, 19, 1))
+x_change, x_id = x.chunk(2, dim=1)  
+x_cond = torch.rand((1, 2, 19, 1))
+model_coupling = Coupling(in_channels=3, cond_channels=2, mid_channels=256)
+model_nn = NN(in_channels=1, cond_channels=2, mid_channels=256, 
+                out_channels=2)
 
-#x, y, z = model(pose3d, pose2d)
-y = model.reverse([pose3d, pose3d, pose3d], pose2d)
-print(y.shape)
+x, ldj = model_coupling(x, x_cond)
+print(x.shape)
